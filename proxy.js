@@ -7,6 +7,8 @@
 // process.env so neither printenv nor /proc/self/environ (via child
 // processes) can leak them.
 //
+// Logs per-request usage and cost to ~/.api-proxy-logs/usage-YYYY-MM-DD.jsonl.
+//
 // Usage:
 //   MOONSHOT_API_KEY=sk-... OPENAI_API_KEY=sk-... \
 //     node proxy.js routes.json
@@ -31,6 +33,80 @@ if (!configPath) {
 const routes = JSON.parse(fs.readFileSync(path.resolve(configPath), "utf8"));
 
 // ---------------------------------------------------------------------------
+// Pricing (USD per token)
+// ---------------------------------------------------------------------------
+
+const PRICING = {
+  moonshot: {
+    input:  0.60 / 1e6,
+    output: 3.00 / 1e6,
+  },
+  openai: {
+    input:  2.50 / 1e6,
+    output: 10.00 / 1e6,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Usage logging
+// ---------------------------------------------------------------------------
+
+const LOG_DIR = path.join(process.env.HOME || "/tmp", ".api-proxy-logs");
+fs.mkdirSync(LOG_DIR, { recursive: true });
+
+function logUsage(routeName, model, usage, cost) {
+  const date = new Date().toISOString().split("T")[0];
+  const file = path.join(LOG_DIR, `usage-${date}.jsonl`);
+  const entry = JSON.stringify({
+    t: Date.now(),
+    route: routeName,
+    model: model,
+    input: usage.prompt_tokens || 0,
+    output: usage.completion_tokens || 0,
+    total: usage.total_tokens || 0,
+    cost: +cost.toFixed(6),
+  });
+  fs.appendFile(file, entry + "\n", () => {});
+  console.log(
+    `[${routeName}] ${model || "?"}: $${cost.toFixed(4)} ` +
+    `(in:${usage.prompt_tokens || 0} out:${usage.completion_tokens || 0})`
+  );
+}
+
+function calculateCost(routeName, usage) {
+  const p = PRICING[routeName] || PRICING.moonshot;
+  const inp = usage.prompt_tokens || 0;
+  const out = usage.completion_tokens || 0;
+  return inp * (p.input || 0) + out * (p.output || 0);
+}
+
+// Extract usage from buffered response data (handles JSON and SSE)
+function extractUsage(data) {
+  const text = data.toString("utf8");
+
+  // Try plain JSON response first
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed.usage) return { usage: parsed.usage, model: parsed.model };
+  } catch (_) {}
+
+  // SSE: scan for the last chunk with usage (typically the final data: line)
+  let lastUsage = null;
+  let model = null;
+  const lines = text.split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+    try {
+      const chunk = JSON.parse(line.slice(6));
+      if (chunk.model) model = chunk.model;
+      if (chunk.usage) lastUsage = chunk.usage;
+    } catch (_) {}
+  }
+  if (lastUsage) return { usage: lastUsage, model };
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot keys then scrub ALL env vars
 // ---------------------------------------------------------------------------
 
@@ -44,8 +120,6 @@ for (const route of routes) {
   keys[route.keyEnv] = val;
 }
 
-// Scrub everything — bws run may inject secrets we don't need here.
-// Keep only what Node.js needs to function.
 const keepEnv = new Set(["HOME", "PATH", "NODE_PATH", "TMPDIR", "TZ", "LANG", "USER"]);
 for (const key of Object.keys(process.env)) {
   if (!keepEnv.has(key)) {
@@ -70,7 +144,6 @@ for (const route of routes) {
 
     const headers = Object.assign({}, req.headers);
     delete headers.host;
-    // Strip any incoming auth and replace with the real key
     delete headers.authorization;
     headers["authorization"] = "Bearer " + apiKey;
 
@@ -78,8 +151,26 @@ for (const route of routes) {
       method: req.method,
       headers: headers,
     }, (proxyRes) => {
+      // Stream response to client while also accumulating for usage extraction
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
+
+      const chunks = [];
+      proxyRes.on("data", (chunk) => {
+        res.write(chunk);
+        chunks.push(chunk);
+      });
+
+      proxyRes.on("end", () => {
+        res.end();
+        // Extract usage asynchronously (don't block the response)
+        try {
+          const result = extractUsage(Buffer.concat(chunks));
+          if (result) {
+            const cost = calculateCost(label, result.usage);
+            logUsage(label, result.model || "", result.usage, cost);
+          }
+        } catch (_) {}
+      });
     });
 
     proxyReq.on("error", (err) => {
