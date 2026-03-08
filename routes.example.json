@@ -1,0 +1,14 @@
+[
+  {
+    "name": "moonshot",
+    "port": 18792,
+    "upstream": "https://api.moonshot.ai",
+    "keyEnv": "MOONSHOT_API_KEY"
+  },
+  {
+    "name": "openai",
+    "port": 18793,
+    "upstream": "https://api.openai.com",
+    "keyEnv": "OPENAI_API_KEY"
+  }
+]
