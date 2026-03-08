@@ -31,7 +31,7 @@ if (!configPath) {
 const routes = JSON.parse(fs.readFileSync(path.resolve(configPath), "utf8"));
 
 // ---------------------------------------------------------------------------
-// Snapshot keys then scrub from env
+// Snapshot keys then scrub ALL env vars
 // ---------------------------------------------------------------------------
 
 const keys = {};
@@ -42,7 +42,15 @@ for (const route of routes) {
     process.exit(1);
   }
   keys[route.keyEnv] = val;
-  delete process.env[route.keyEnv];
+}
+
+// Scrub everything — bws run may inject secrets we don't need here.
+// Keep only what Node.js needs to function.
+const keepEnv = new Set(["HOME", "PATH", "NODE_PATH", "TMPDIR", "TZ", "LANG", "USER"]);
+for (const key of Object.keys(process.env)) {
+  if (!keepEnv.has(key)) {
+    delete process.env[key];
+  }
 }
 
 // ---------------------------------------------------------------------------
